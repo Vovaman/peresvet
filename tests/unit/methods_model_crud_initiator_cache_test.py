@@ -138,6 +138,28 @@ def _make_service(hierarchy, wrap_root=False):
     return svc
 
 
+def test_delete_initiator_wrapped_cache_does_not_clear_other_schedule():
+    hierarchy = _Hierarchy(
+        missing_nodes=["dead-method"],
+        present_methods=["live-method"],
+    )
+    svc = _make_service(hierarchy, wrap_root=True)
+    svc._cache.store["deleted-tag.methods_model_crud"] = ["dead-method", "live-method"]
+    svc._cache.store["other-sched.methods_model_crud"] = ["sibling-method"]
+
+    asyncio.run(
+        MethodsModelCRUD._delete_initiator(
+            svc,
+            {"id": "deleted-tag"},
+            "prsTag.model.deleted.deleted-tag",
+        )
+    )
+
+    assert "deleted-tag.methods_model_crud" not in svc._cache.store
+    assert svc._cache.store["other-sched.methods_model_crud"] == ["sibling-method"]
+    assert hierarchy.deleted == ["live-method:deleted-tag"]
+
+
 def test_delete_initiator_continues_after_missing_method_and_keeps_other_cache():
     hierarchy = _Hierarchy(
         missing_nodes=["dead-method"],

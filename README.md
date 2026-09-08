@@ -2,6 +2,10 @@
    <img src="pics/logo.png" alt="Пересвет" />
 </div>
 
+[![Лицензия Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-green.svg)
+[![Coverage Status](https://coveralls.io/repos/github/mp-co-ru/peresvet/badge.svg?branch=dev)](https://coveralls.io/github/mp-co-ru/peresvet?branch=dev)
+
 # Содержание
 
 ---
@@ -12,9 +16,10 @@
 4. [`Запуск платформы из продуктового дистрибутива`](#running_product_distribution)
 5. [`Примеры использования`](#examples)
 6. [`Отладка`](#debugging)
-7. [`Генерация документации`](#make_docs)
-8. [`Бэкап и восстановление всех работающих Docker-контейнеров`](#docker_runtime_backup)
-9. [`Бэкап и восстановление LDAP`](#ldap_backup)
+7. [`Запуск unit-тестов`](#tests)
+8. [`Генерация документации`](#make_docs)
+9. [`Бэкап и восстановление всех работающих Docker-контейнеров`](#docker_runtime_backup)
+10. [`Бэкап и восстановление LDAP`](#ldap_backup)
 
 ---
 
@@ -552,9 +557,14 @@ cd /путь/к/peresvet
 
 # <a name="tests"></a>Запуск unit-тестов
 
-Находясь в корневой папке проекта, запускаем файл `run_tests.sh`.
+Находясь в корневой папке проекта:
+
+```bash
+$ pytest
+```
 
 Будут запущены unit-тесты, также будет показана статистика покрытия тестами исходных кодов проекта.
+При пуше и pull request в ветку `dev` тот же прогон выполняется GitHub Actions, покрытие уходит на [Coveralls](https://coveralls.io/github/mp-co-ru/peresvet?branch=dev).
 
 ## Подготовка
 1. Копируем платформу со [страницы релизов](https://github.com/Vovaman/peresvet/releases).

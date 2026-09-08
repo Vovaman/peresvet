@@ -193,6 +193,8 @@ class _Hierarchy:
         return self.initiator_classes.get(node_id, "prsTag")
 
     async def get_parent(self, method_id):
+        if isinstance(self.parent_tag_id, dict):
+            return self.parent_tag_id.get(method_id, "result-tag"), None
         return self.parent_tag_id, None
 
 
@@ -474,3 +476,120 @@ def test_delete_method_cache_unwraps_json_root_and_keeps_sibling():
 
     assert "method-1.methods_app" not in svc._cache.store
     assert svc._cache.store["sched-1.methods_app"] == {"method-b": "other-tag"}
+
+
+def _shared_schedule_objects(*, wrap_root=False, extra_initiators=None):
+    initiators = {
+        "method-a": ["sched-speeds"],
+        "method-b": ["sched-speeds"],
+    }
+    initiator_classes = {"sched-speeds": "prsSchedule"}
+    if extra_initiators:
+        for method_id, ids in extra_initiators.items():
+            initiators[method_id] = list(initiators.get(method_id, [])) + list(ids)
+            for initiator_id in ids:
+                initiator_classes.setdefault(initiator_id, "prsTag")
+    hierarchy = _Hierarchy(
+        method_ids=["method-a", "method-b"],
+        method_type=0,
+        initiators=initiators,
+        initiator_classes=initiator_classes,
+        parent_tag_id={"method-a": "tag-speed-a", "method-b": "tag-speed-b"},
+    )
+    svc = _make_service(hierarchy, wrap_root=wrap_root)
+    asyncio.run(MethodsApp._make_method_cache(svc, "method-a"))
+    asyncio.run(MethodsApp._make_method_cache(svc, "method-b"))
+    invoked = []
+
+    async def _calc_tag(tag_id, method_id, parameters, data):
+        invoked.append((method_id, tag_id))
+
+    svc._calc_tag = _calc_tag
+    return hierarchy, svc, invoked
+
+
+def test_object_cascade_does_not_stop_sibling_schedule_methods():
+    # Два независимых объекта, один schedule, prsEntityTypeCode=0.
+    # Каскад удаления A: prsMethod.model.deleting, пока узел ещё в LDAP.
+    # Следующий fire_event должен вызвать только метод B.
+    hierarchy, svc, invoked = _shared_schedule_objects()
+
+    asyncio.run(MethodsApp._start_method_by_sched(svc, {"id": "sched-speeds", "time": 1}))
+    assert {method_id for method_id, _ in invoked} == {"method-a", "method-b"}
+
+    invoked.clear()
+    svc._amqp_consume_queue.calls.clear()
+    asyncio.run(MethodsApp._deleting(svc, {"id": "method-a"}))
+    hierarchy.missing_nodes.add("method-a")
+
+    assert ("unbind", "main", "prsSchedule.app.fire_event.sched-speeds") not in svc._amqp_consume_queue.calls
+    assert svc._cache.store["sched-speeds.methods_app"] == {"method-b": "tag-speed-b"}
+    assert "method-a.methods_app" not in svc._cache.store
+
+    asyncio.run(MethodsApp._start_method_by_sched(svc, {"id": "sched-speeds", "time": 2}))
+
+    assert invoked == [("method-b", "tag-speed-b")]
+
+
+def test_object_cascade_does_not_stop_sibling_schedule_methods_with_redisjson_wrap():
+    hierarchy, svc, invoked = _shared_schedule_objects(wrap_root=True)
+
+    asyncio.run(MethodsApp._start_method_by_sched(svc, {"id": "sched-speeds", "time": 1}))
+    assert {method_id for method_id, _ in invoked} == {"method-a", "method-b"}
+
+    invoked.clear()
+    svc._amqp_consume_queue.calls.clear()
+    asyncio.run(MethodsApp._deleting(svc, {"id": "method-a"}))
+    hierarchy.missing_nodes.add("method-a")
+
+    assert ("unbind", "main", "prsSchedule.app.fire_event.sched-speeds") not in svc._amqp_consume_queue.calls
+    assert svc._cache.store["sched-speeds.methods_app"] == {"method-b": "tag-speed-b"}
+
+    asyncio.run(MethodsApp._start_method_by_sched(svc, {"id": "sched-speeds", "time": 2}))
+
+    assert invoked == [("method-b", "tag-speed-b")]
+
+
+def test_deleting_already_gone_method_does_not_unbind_sibling_schedule():
+    # Каскад LDAP уже снял метод A; one_app ещё обрабатывает deleting/deleted.
+    hierarchy, svc, invoked = _shared_schedule_objects()
+    hierarchy.missing_nodes.add("method-a")
+    svc._amqp_consume_queue.calls.clear()
+
+    asyncio.run(MethodsApp._deleting(svc, {"id": "method-a"}))
+
+    assert ("unbind", "main", "prsSchedule.app.fire_event.sched-speeds") not in svc._amqp_consume_queue.calls
+    assert svc._cache.store["sched-speeds.methods_app"] == {"method-b": "tag-speed-b"}
+
+    asyncio.run(MethodsApp._start_method_by_sched(svc, {"id": "sched-speeds", "time": 3}))
+
+    assert invoked == [("method-b", "tag-speed-b")]
+
+
+def test_tag_initiated_method_on_sibling_still_runs_after_shared_schedule_peer_deleted():
+    hierarchy, svc, invoked = _shared_schedule_objects(
+        extra_initiators={"method-b": ["tag-counter"]}
+    )
+    svc._amqp_consume_queue.calls.clear()
+
+    asyncio.run(MethodsApp._deleting(svc, {"id": "method-a"}))
+    hierarchy.missing_nodes.add("method-a")
+
+    assert ("unbind", "main", "prsTag.app.data_set.tag-counter") not in svc._amqp_consume_queue.calls
+    assert ("unbind", "main", "prsSchedule.app.fire_event.sched-speeds") not in svc._amqp_consume_queue.calls
+
+    asyncio.run(
+        MethodsApp._start_method_by_tag(
+            svc,
+            {
+                "data": [
+                    {
+                        "tagId": "tag-counter",
+                        "data": [[4, 473, None]],
+                    }
+                ]
+            },
+        )
+    )
+
+    assert invoked == [("method-b", "tag-speed-b")]
