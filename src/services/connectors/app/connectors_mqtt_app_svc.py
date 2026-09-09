@@ -1,9 +1,13 @@
 import sys
 import json
 import asyncio
+import base64
+import os
 import re
 from collections import deque
 from collections.abc import Iterable
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 from fastapi import APIRouter
 import aio_pika
@@ -87,6 +91,34 @@ def connector_id_from_broker_connection_headers(headers: dict | None) -> str | N
         if conn_id:
             return conn_id
     return None
+
+
+def connector_id_from_management_connection(connection: dict | None) -> str | None:
+    """Id коннектора из элемента ``GET /api/connections`` (MQTT client_id = UUID)."""
+    if not isinstance(connection, dict):
+        return None
+    props = connection.get("client_properties")
+    headers = {
+        "protocol": connection.get("protocol"),
+        "client_properties": props if isinstance(props, dict) else {},
+        "client_id": connection.get("client_id"),
+        "user": connection.get("user"),
+    }
+    return connector_id_from_broker_connection_headers(headers)
+
+
+def live_mqtt_connector_ids_from_management_connections(connections) -> list[str]:
+    """UUID коннекторов с живой MQTT-сессией на брокере."""
+    ids: list[str] = []
+    seen: set[str] = set()
+    if not isinstance(connections, list):
+        return ids
+    for item in connections:
+        conn_id = connector_id_from_management_connection(item)
+        if conn_id and conn_id not in seen:
+            seen.add(conn_id)
+            ids.append(conn_id)
+    return ids
 
 
 class ConnectorsMQTTApp(AppSvc):
@@ -675,6 +707,66 @@ class ConnectorsMQTTApp(AppSvc):
             f"{self._config.svc_name} :: Подписка на события брокера connection.created/closed."
         )
 
+    def _rabbitmq_management_connections_settings(self) -> tuple[str, str]:
+        amqp_url = (self._config.broker or {}).get("amqp_url", "")
+        parsed = urlparse(amqp_url)
+        host = parsed.hostname or os.getenv("RABBIT_HOST", "rabbitmq")
+        port = os.getenv("RABBIT_UI_PORT", "15672")
+        user = parsed.username or os.getenv("RABBITMQ_DEFAULT_USER", "guest")
+        password = parsed.password or os.getenv("RABBITMQ_DEFAULT_PASS", "guest")
+        url = f"http://{host}:{port}/api/connections"
+        auth_token = base64.b64encode(f"{user}:{password}".encode()).decode()
+        return url, auth_token
+
+    @staticmethod
+    def _fetch_rabbitmq_json(url: str, auth_token: str):
+        request = Request(url, headers={"Authorization": f"Basic {auth_token}"})
+        with urlopen(request, timeout=5) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    async def _fetch_rabbitmq_management_connections(self) -> list:
+        url, auth_token = self._rabbitmq_management_connections_settings()
+        payload = await asyncio.to_thread(self._fetch_rabbitmq_json, url, auth_token)
+        if not isinstance(payload, list):
+            return []
+        return payload
+
+    async def _restore_connected_connectors_from_live_sessions(self) -> None:
+        """После рестарта сервиса зелёный кружок ставится по живым MQTT-сессиям брокера.
+
+        Не пишет качество 101 и не шлёт full_configuration: коннектор уже работает
+        на существующей сессии и сам не повторяет getConfig.
+        """
+        try:
+            connections = await self._fetch_rabbitmq_management_connections()
+            allowed = {
+                str(node).strip().lower()
+                for node in (getattr(self._config, "nodes", None) or [])
+                if node
+            }
+            restored: list[str] = []
+            for conn_id in live_mqtt_connector_ids_from_management_connections(connections):
+                if allowed and conn_id not in allowed:
+                    continue
+                # connection.closed мог прийти после подписки и до снимка API
+                if self._connector_session_epoch.get(conn_id, 0) != 0:
+                    continue
+                if conn_id in self._connected_connectors:
+                    continue
+                self._connected_connectors.add(conn_id)
+                restored.append(conn_id)
+
+            if restored:
+                self._logger.info(
+                    f"{self._config.svc_name} :: Восстановлен статус MQTT-связи "
+                    f"по живым сессиям: {restored}."
+                )
+        except Exception as ex:
+            self._logger.warning(
+                f"{self._config.svc_name} :: Не удалось восстановить статус MQTT-связи "
+                f"по живым сессиям: {ex}."
+            )
+
     async def on_startup(self) -> None:
 
         await super().on_startup()
@@ -688,6 +780,7 @@ class ConnectorsMQTTApp(AppSvc):
             else:
                 await self._bind_conn(conn_id="*", bind=True)
             await self._subscribe_broker_connection_events()
+            await self._restore_connected_connectors_from_live_sessions()
         except Exception as ex:
             self._logger.error(f"{self._config.svc_name} :: Ошибка инициализации сервиса коннекторов: {ex}")
 
